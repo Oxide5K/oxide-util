@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText};
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 
@@ -17,28 +18,85 @@ enum Msg {
     Updated(String),
 }
 
+enum Upd {
+    Checked(Result<Option<String>, String>),
+    InstallerStarted(Result<(), String>),
+}
+
 #[derive(Default)]
 struct App {
     pkgs: Vec<Pkg>,
     busy: Option<String>,
     status: String,
     rx: Option<Receiver<Msg>>,
+    upd_rx: Option<Receiver<Upd>>,
+    upd_status: String,
+    latest: Option<String>,
+    auto_update: bool,
+    show_settings: bool,
 }
 
 const ACCENT: Color32 = Color32::from_rgb(120, 200, 255);
 const CARD: Color32 = Color32::from_rgb(28, 38, 52);
+const RELEASES: &str = "https://github.com/Oxide5K/oxide-util/releases/latest";
+
+fn hidden(exe: &str) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
 
 fn winget(args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("winget");
-    cmd.args(args)
-        .args(["--accept-source-agreements", "--disable-interactivity"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let out = cmd.output().map_err(|e| format!("Could not run winget: {e}"))?;
+    let out = hidden("winget")
+        .args(args)
+        .args(["--accept-source-agreements", "--disable-interactivity"])
+        .output()
+        .map_err(|e| format!("Could not run winget: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Auto-update is on unless this marker file exists.
+fn no_auto_update_marker() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("oxide-util").join("no-auto-update")
+}
+
+fn ver(s: &str) -> Vec<u32> {
+    s.trim().trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+/// Latest release tag, if newer than this build.
+fn check_latest() -> Result<Option<String>, String> {
+    // /releases/latest redirects to /releases/tag/<tag>; reading the redirect skips the rate-limited JSON API
+    let out = hidden("curl.exe")
+        .args(["-sI", "-o", "NUL", "-w", "%{redirect_url}", RELEASES])
+        .output()
+        .map_err(|e| format!("Could not run curl: {e}"))?;
+    let url = String::from_utf8_lossy(&out.stdout);
+    let tag = url.rsplit_once("/tag/").map(|(_, t)| t.trim().to_string()).ok_or("Could not reach GitHub")?;
+    Ok((ver(&tag) > ver(env!("CARGO_PKG_VERSION"))).then_some(tag))
+}
+
+/// Downloads the latest MSI and starts a detached installer that relaunches the app; the caller must exit.
+fn start_installer() -> Result<(), String> {
+    let msi = std::env::temp_dir().join("oxide-util-update.msi");
+    let ok = hidden("curl.exe")
+        .args(["-sfL", "-o"])
+        .arg(&msi)
+        .arg(format!("{RELEASES}/download/oxide-util.msi"))
+        .status()
+        .map_err(|e| format!("Could not run curl: {e}"))?
+        .success();
+    if !ok {
+        return Err("Downloading the update failed.".into());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // cmd outlives us: waits for msiexec to replace the files, then reopens the app
+    hidden("cmd")
+        .arg("/c")
+        .raw_arg(format!("start /wait msiexec /i \"{}\" /passive & start \"\" \"{}\"", msi.display(), exe.display()))
+        .spawn()
+        .map_err(|e| format!("Could not start installer: {e}"))?;
+    Ok(())
 }
 
 /// Parses the fixed-width table that `winget upgrade` prints.
@@ -99,6 +157,17 @@ impl App {
         });
     }
 
+    fn updater(&mut self, ctx: &egui::Context, label: &str, job: impl FnOnce() -> Upd + Send + 'static) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+            ctx.request_repaint();
+        });
+        self.upd_status = label.into();
+        self.upd_rx = Some(rx);
+    }
+
     fn update(&mut self, ctx: &egui::Context, id: Option<String>) {
         let target = id.clone().unwrap_or_else(|| "everything".into());
         self.run(ctx, format!("Updating {target}..."), move || {
@@ -132,7 +201,49 @@ impl eframe::App for App {
                 }
             }
         }
+        if let Some(msg) = self.upd_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.upd_rx = None;
+            match msg {
+                Upd::Checked(Ok(Some(tag))) => {
+                    self.upd_status = format!("{tag} is available.");
+                    self.latest = Some(tag);
+                }
+                Upd::Checked(Ok(None)) => self.upd_status = "You're on the latest version.".into(),
+                Upd::Checked(Err(e)) | Upd::InstallerStarted(Err(e)) => self.upd_status = e,
+                Upd::InstallerStarted(Ok(())) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
+        }
         let idle = self.busy.is_none();
+        let upd_idle = self.upd_rx.is_none();
+
+        let mut open = self.show_settings;
+        let mut check_now = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Oxide Util v{}", env!("CARGO_PKG_VERSION")));
+                if ui.checkbox(&mut self.auto_update, "Check for updates when the app opens").changed() {
+                    let m = no_auto_update_marker();
+                    let _ = if self.auto_update {
+                        std::fs::remove_file(&m)
+                    } else {
+                        std::fs::create_dir_all(m.parent().unwrap()).and_then(|_| std::fs::write(&m, ""))
+                    };
+                }
+                ui.horizontal(|ui| {
+                    check_now = ui.add_enabled(upd_idle, egui::Button::new("Check now")).clicked();
+                    if !upd_idle {
+                        ui.spinner();
+                    }
+                    ui.label(RichText::new(&self.upd_status).weak());
+                });
+            });
+        self.show_settings = open;
+        if check_now {
+            self.updater(ctx, "Checking for updates...", || Upd::Checked(check_latest()));
+        }
 
         egui::TopBottomPanel::top("top")
             .frame(egui::Frame::none().inner_margin(16.0).fill(Color32::from_rgb(18, 26, 38)))
@@ -147,8 +258,24 @@ impl eframe::App for App {
                         if ui.add_enabled(idle, egui::Button::new("Scan")).clicked() {
                             self.scan(ctx);
                         }
+                        if ui.button("Settings").clicked() {
+                            self.show_settings = !self.show_settings;
+                        }
                     });
                 });
+                if let Some(tag) = self.latest.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Oxide Util {tag} is available.")).color(ACCENT));
+                        let install = egui::Button::new(RichText::new("Install & restart").color(Color32::BLACK)).fill(ACCENT);
+                        if ui.add_enabled(upd_idle, install).clicked() {
+                            self.updater(ctx, "Downloading update...", || Upd::InstallerStarted(start_installer()));
+                        }
+                        if !upd_idle {
+                            ui.spinner();
+                            ui.label(&self.upd_status);
+                        }
+                    });
+                }
                 ui.horizontal(|ui| match &self.busy {
                     Some(b) => {
                         ui.spinner();
@@ -212,8 +339,11 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            let mut app = App::default();
+            let mut app = App { auto_update: !no_auto_update_marker().exists(), ..Default::default() };
             app.scan(&cc.egui_ctx);
+            if app.auto_update {
+                app.updater(&cc.egui_ctx, "Checking for updates...", || Upd::Checked(check_latest()));
+            }
             Ok(Box::new(app))
         }),
     )
@@ -243,5 +373,12 @@ Discord           Discord.Discord      1.0.9    1.0.10    winget\n\
         );
         assert_eq!(p[1].id, "Discord.Discord");
         assert!(parse("No installed package found matching input criteria.").is_empty());
+    }
+
+    #[test]
+    fn compares_versions() {
+        assert!(ver("v0.10.0") > ver("0.9.9"));
+        assert!(ver("v1.0.0") > ver("0.3.0"));
+        assert!(ver("v0.3.0") <= ver("0.3.0"));
     }
 }

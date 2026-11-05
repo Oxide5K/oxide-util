@@ -11,12 +11,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
       - run: dotnet tool install --global wix --version 5.0.2
       - run: wix build installer.wxs -d Version=$("${{ github.ref_name }}".TrimStart('v')) -arch x64 -o oxide-util.msi
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             oxide-util.msi

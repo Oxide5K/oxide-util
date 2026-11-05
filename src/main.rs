@@ -2,19 +2,49 @@
 
 use eframe::egui::{self, Color32, RichText};
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Kind {
+    #[default]
+    Software,
+    Driver,
+    Windows,
+}
+
+impl Kind {
+    const ALL: [Kind; 3] = [Kind::Software, Kind::Driver, Kind::Windows];
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Software => "Software",
+            Kind::Driver => "Drivers & Firmware",
+            Kind::Windows => "Windows Update",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Pkg {
+    kind: Kind,
     name: String,
+    /// winget package id, or Windows Update UpdateID
     id: String,
     version: String,
     available: String,
+    icon: Option<String>,
+}
+
+#[derive(Default)]
+struct Scan {
+    pkgs: Vec<Pkg>,
+    bios: String,
+    errors: Vec<String>,
 }
 
 enum Msg {
-    Scanned(Result<Vec<Pkg>, String>),
+    Scanned(Scan),
     Updated(String),
 }
 
@@ -26,6 +56,8 @@ enum Upd {
 #[derive(Default)]
 struct App {
     pkgs: Vec<Pkg>,
+    bios: String,
+    tab: Kind,
     busy: Option<String>,
     status: String,
     rx: Option<Receiver<Msg>>,
@@ -40,10 +72,95 @@ const ACCENT: Color32 = Color32::from_rgb(120, 200, 255);
 const CARD: Color32 = Color32::from_rgb(28, 38, 52);
 const RELEASES: &str = "https://github.com/Oxide5K/oxide-util/releases/latest";
 
+/// Lists pending Windows Update items plus one `bios` line, tab-separated: kind, id, title, version.
+const WU_SCAN: &str = r#"
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$b = Get-CimInstance Win32_BIOS
+$m = Get-CimInstance Win32_BaseBoard
+"bios`t`t$($m.Manufacturer) $($m.Product)`tBIOS $($b.SMBIOSBIOSVersion) ($($b.ReleaseDate.ToString('yyyy-MM-dd')))"
+$r = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search('IsInstalled=0 and IsHidden=0')
+foreach ($u in $r.Updates) {
+    if ($u.Type -eq 2) {
+        $k = 'driver'
+        $v = if ($u.DriverClass -eq 'Firmware') { 'Firmware' } else { "$($u.DriverClass)" }
+    } else {
+        $k = 'windows'
+        $v = ($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ' '
+    }
+    "$k`t$($u.Identity.UpdateID)`t$($u.Title)`t$v"
+}
+"#;
+
+/// Installs the given Windows Update ids. Runs elevated. Exit: 2 ok, 3 partial, 10 ok + restart needed.
+const WU_INSTALL: &str = r#"
+param([string]$Ids)
+$want = $Ids -split ','
+$s = New-Object -ComObject Microsoft.Update.Session
+$r = $s.CreateUpdateSearcher().Search('IsInstalled=0 and IsHidden=0')
+$c = New-Object -ComObject Microsoft.Update.UpdateColl
+foreach ($u in $r.Updates) {
+    if ($want -contains $u.Identity.UpdateID) {
+        if (-not $u.EulaAccepted) { $u.AcceptEula() }
+        [void]$c.Add($u)
+    }
+}
+if ($c.Count -eq 0) { exit 2 }
+$d = $s.CreateUpdateDownloader(); $d.Updates = $c; [void]$d.Download()
+$i = $s.CreateUpdateInstaller(); $i.Updates = $c; $res = $i.Install()
+if ($res.RebootRequired -and $res.ResultCode -eq 2) { exit 10 }
+exit $res.ResultCode
+"#;
+
+/// Starts a script elevated (UAC prompt) and passes back its exit code.
+const ELEVATE: &str = r#"
+param([string]$Script, [string]$Ids)
+$ErrorActionPreference = 'Stop'
+$p = Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$Script`" -Ids $Ids"
+exit $p.ExitCode
+"#;
+
+/// Prints `DisplayName<TAB>png path` for every installed app whose icon could be extracted.
+const ICONS: &str = r#"
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Drawing
+$dir = Join-Path $env:LOCALAPPDATA 'oxide-util\icons'
+New-Item -ItemType Directory -Force $dir | Out-Null
+$keys = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+foreach ($e in Get-ItemProperty $keys -ErrorAction SilentlyContinue) {
+    if (-not $e.DisplayName -or -not $e.DisplayIcon) { continue }
+    $src = ($e.DisplayIcon -replace ',\s*-?\d+$', '').Trim('"', ' ')
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { continue }
+    $out = Join-Path $dir (($e.PSChildName -replace '[^\w.-]', '_') + '.png')
+    try {
+        if (-not (Test-Path -LiteralPath $out)) {
+            [Drawing.Icon]::ExtractAssociatedIcon($src).ToBitmap().Save($out, [Drawing.Imaging.ImageFormat]::Png)
+        }
+        "$($e.DisplayName)`t$out"
+    } catch {}
+}
+"#;
+
 fn hidden(exe: &str) -> Command {
     let mut cmd = Command::new(exe);
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd
+}
+
+fn script_file(name: &str, body: &str) -> Result<PathBuf, String> {
+    let path = std::env::temp_dir().join(format!("oxide-util-{name}.ps1"));
+    std::fs::write(&path, body).map_err(|e| format!("Could not write {name} script: {e}"))?;
+    Ok(path)
+}
+
+fn powershell(name: &str, body: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    hidden("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(script_file(name, body)?)
+        .args(args)
+        .output()
+        .map_err(|e| format!("Could not run PowerShell: {e}"))
 }
 
 fn winget(args: &[&str]) -> Result<String, String> {
@@ -55,9 +172,144 @@ fn winget(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Parses the fixed-width table that `winget upgrade` prints.
+// shortcut: column offsets are char counts, so names with double-width chars may misalign; switch to the WinGet COM API if that bites.
+fn parse(out: &str) -> Vec<Pkg> {
+    // winget redraws its spinner with \r; keep only what follows the last one
+    let lines: Vec<&str> = out
+        .lines()
+        .map(|l| l.rsplit('\r').next().unwrap_or(l))
+        .collect();
+    let Some(h) = lines
+        .iter()
+        .position(|l| l.contains(" Id ") && l.contains("Version"))
+    else {
+        return vec![];
+    };
+    let header = lines[h];
+    let col = |name: &str| header.find(name).map(|b| header[..b].chars().count());
+    let (Some(id), Some(ver), Some(avail)) = (col("Id"), col("Version"), col("Available")) else {
+        return vec![];
+    };
+    let src = col("Source");
+    lines[h + 2..]
+        .iter()
+        .take_while(|l| l.chars().count() > avail)
+        .map(|l| {
+            let c: Vec<char> = l.chars().collect();
+            let cut = |a: usize, b: Option<usize>| {
+                let b = b.unwrap_or(c.len()).min(c.len());
+                c[a.min(b)..b].iter().collect::<String>().trim().to_string()
+            };
+            Pkg {
+                name: cut(0, Some(id)),
+                id: cut(id, Some(ver)),
+                version: cut(ver, Some(avail)),
+                available: cut(avail, src),
+                ..Default::default()
+            }
+        })
+        .filter(|p| !p.id.is_empty())
+        .collect()
+}
+
+/// Parses WU_SCAN output into update rows and the BIOS summary line.
+fn parse_wu(out: &str) -> (Vec<Pkg>, String) {
+    let mut bios = String::new();
+    let mut pkgs = vec![];
+    for l in out.lines() {
+        let f: Vec<&str> = l.split('\t').collect();
+        let [k, id, name, v] = f[..] else { continue };
+        let kind = match k {
+            "bios" => {
+                bios = format!("{} - {}", name.trim(), v.trim());
+                continue;
+            }
+            "driver" => Kind::Driver,
+            "windows" => Kind::Windows,
+            _ => continue,
+        };
+        pkgs.push(Pkg { kind, name: name.into(), id: id.into(), available: v.into(), ..Default::default() });
+    }
+    (pkgs, bios)
+}
+
+/// Finds the icon for a winget row by its (possibly truncated) name.
+// shortcut: name-prefix matching misses apps whose winget name differs from their Add/Remove name; match on product codes if that's common.
+fn find_icon<'a>(name: &str, icons: &'a [(String, String)]) -> Option<&'a String> {
+    let n = name.trim_end_matches('…').trim().to_lowercase();
+    if n.is_empty() {
+        return None;
+    }
+    let lower = |s: &String| s.to_lowercase();
+    icons
+        .iter()
+        .find(|(d, _)| lower(d) == n)
+        .or_else(|| icons.iter().find(|(d, _)| lower(d).starts_with(&n) || n.starts_with(&lower(d))))
+        .map(|(_, p)| p)
+}
+
+fn scan_all() -> Scan {
+    std::thread::scope(|s| {
+        let sw = s.spawn(|| winget(&["upgrade", "--include-unknown"]).map(|o| parse(&o)));
+        let wu = s.spawn(|| powershell("scan", WU_SCAN, &[]));
+        let icons = s.spawn(|| powershell("icons", ICONS, &[]));
+
+        let mut scan = Scan::default();
+        let icons: Vec<(String, String)> = match icons.join().unwrap() {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.split_once('\t'))
+                .map(|(d, p)| (d.to_string(), p.to_string()))
+                .collect(),
+            Err(_) => vec![],
+        };
+        match sw.join().unwrap() {
+            Ok(mut p) => {
+                for pkg in &mut p {
+                    pkg.icon = find_icon(&pkg.name, &icons).cloned();
+                }
+                scan.pkgs.extend(p);
+            }
+            Err(e) => scan.errors.push(e),
+        }
+        match wu.join().unwrap() {
+            Ok(o) if o.status.success() => {
+                let (p, bios) = parse_wu(&String::from_utf8_lossy(&o.stdout));
+                scan.pkgs.extend(p);
+                scan.bios = bios;
+            }
+            Ok(o) => scan.errors.push(format!("Windows Update scan failed: {}", String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("").trim())),
+            Err(e) => scan.errors.push(e),
+        }
+        scan
+    })
+}
+
+/// Installs Windows Update items elevated (one UAC prompt).
+fn install_wu(ids: &[String]) -> String {
+    // ids come from Windows Update itself, but they end up on a command line, so allow only GUID characters
+    if ids.iter().any(|id| !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')) {
+        return "Refusing to install: unexpected update id.".into();
+    }
+    let run = || -> Result<i32, String> {
+        let script = script_file("install", WU_INSTALL)?;
+        let out = powershell("elevate", ELEVATE, &["-Script", &script.to_string_lossy(), "-Ids", &ids.join(",")])?;
+        Ok(out.status.code().unwrap_or(-1))
+    };
+    match run() {
+        Ok(2) => "Windows updates installed.".into(),
+        Ok(3) => "Some Windows updates failed to install.".into(),
+        Ok(10) => "Windows updates installed. Restart your PC to finish.".into(),
+        Ok(1) => "Install cancelled (administrator permission is needed).".into(),
+        Ok(c) => format!("Windows Update install failed (code {c})."),
+        Err(e) => e,
+    }
+}
+
 /// Auto-update is on unless this marker file exists.
-fn no_auto_update_marker() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("oxide-util").join("no-auto-update")
+fn no_auto_update_marker() -> PathBuf {
+    PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("oxide-util").join("no-auto-update")
 }
 
 fn ver(s: &str) -> Vec<u32> {
@@ -99,44 +351,16 @@ fn start_installer() -> Result<(), String> {
     Ok(())
 }
 
-/// Parses the fixed-width table that `winget upgrade` prints.
-// shortcut: column offsets are char counts, so names with double-width chars may misalign; switch to the WinGet COM API if that bites.
-fn parse(out: &str) -> Vec<Pkg> {
-    // winget redraws its spinner with \r; keep only what follows the last one
-    let lines: Vec<&str> = out
-        .lines()
-        .map(|l| l.rsplit('\r').next().unwrap_or(l))
-        .collect();
-    let Some(h) = lines
-        .iter()
-        .position(|l| l.contains(" Id ") && l.contains("Version"))
-    else {
-        return vec![];
-    };
-    let header = lines[h];
-    let col = |name: &str| header.find(name).map(|b| header[..b].chars().count());
-    let (Some(id), Some(ver), Some(avail)) = (col("Id"), col("Version"), col("Available")) else {
-        return vec![];
-    };
-    let src = col("Source");
-    lines[h + 2..]
-        .iter()
-        .take_while(|l| l.chars().count() > avail)
-        .map(|l| {
-            let c: Vec<char> = l.chars().collect();
-            let cut = |a: usize, b: Option<usize>| {
-                let b = b.unwrap_or(c.len()).min(c.len());
-                c[a.min(b)..b].iter().collect::<String>().trim().to_string()
-            };
-            Pkg {
-                name: cut(0, Some(id)),
-                id: cut(id, Some(ver)),
-                version: cut(ver, Some(avail)),
-                available: cut(avail, src),
-            }
-        })
-        .filter(|p| !p.id.is_empty())
-        .collect()
+fn app_icon(ui: &mut egui::Ui, p: &Pkg) {
+    let size = egui::vec2(32.0, 32.0);
+    if let Some(path) = &p.icon {
+        ui.add(egui::Image::new(format!("file://{path}")).fit_to_exact_size(size));
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, 8.0, ACCENT.gamma_multiply(0.2));
+    let letter = p.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, letter, egui::FontId::proportional(16.0), ACCENT);
 }
 
 impl App {
@@ -151,12 +375,6 @@ impl App {
         self.rx = Some(rx);
     }
 
-    fn scan(&mut self, ctx: &egui::Context) {
-        self.run(ctx, "Scanning for updates...".into(), || {
-            Msg::Scanned(winget(&["upgrade", "--include-unknown"]).map(|o| parse(&o)))
-        });
-    }
-
     fn updater(&mut self, ctx: &egui::Context, label: &str, job: impl FnOnce() -> Upd + Send + 'static) {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
@@ -168,11 +386,23 @@ impl App {
         self.upd_rx = Some(rx);
     }
 
-    fn update(&mut self, ctx: &egui::Context, id: Option<String>) {
-        let target = id.clone().unwrap_or_else(|| "everything".into());
+    fn scan(&mut self, ctx: &egui::Context) {
+        self.run(ctx, "Scanning your PC (Windows Update can take a minute)...".into(), || Msg::Scanned(scan_all()));
+    }
+
+    /// Updates the given rows of one category; `None` means everything in it.
+    fn update(&mut self, ctx: &egui::Context, kind: Kind, one: Option<String>) {
+        let target = one.clone().unwrap_or_else(|| format!("all {}", kind.label()));
+        let ids: Vec<String> = match &one {
+            Some(id) => vec![id.clone()],
+            None => self.pkgs.iter().filter(|p| p.kind == kind).map(|p| p.id.clone()).collect(),
+        };
         self.run(ctx, format!("Updating {target}..."), move || {
+            if kind != Kind::Software {
+                return Msg::Updated(install_wu(&ids));
+            }
             let mut args = vec!["upgrade", "--silent", "--accept-package-agreements"];
-            match &id {
+            match &one {
                 Some(id) => args.extend(["--id", id.as_str(), "--exact"]),
                 None => args.push("--all"),
             }
@@ -190,11 +420,15 @@ impl eframe::App for App {
             self.busy = None;
             self.rx = None;
             match msg {
-                Msg::Scanned(Ok(p)) => {
-                    self.status = format!("{} update(s) available", p.len());
-                    self.pkgs = p;
+                Msg::Scanned(s) => {
+                    self.status = if s.errors.is_empty() {
+                        format!("{} update(s) available", s.pkgs.len())
+                    } else {
+                        s.errors.join(" ")
+                    };
+                    self.pkgs = s.pkgs;
+                    self.bios = s.bios;
                 }
-                Msg::Scanned(Err(e)) => self.status = e,
                 Msg::Updated(s) => {
                     self.status = s;
                     self.scan(ctx);
@@ -217,14 +451,17 @@ impl eframe::App for App {
         let upd_idle = self.upd_rx.is_none();
 
         let mut open = self.show_settings;
-        let mut check_now = false;
+        let (mut check_now, mut rescan) = (false, false);
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label(format!("Oxide Util v{}", env!("CARGO_PKG_VERSION")));
-                if ui.checkbox(&mut self.auto_update, "Check for updates when the app opens").changed() {
+                ui.add_space(4.0);
+                rescan = ui.add_enabled(idle, egui::Button::new("Re-scan PC")).clicked();
+                ui.separator();
+                if ui.checkbox(&mut self.auto_update, "Check for app updates when it opens").changed() {
                     let m = no_auto_update_marker();
                     let _ = if self.auto_update {
                         std::fs::remove_file(&m)
@@ -244,6 +481,9 @@ impl eframe::App for App {
         if check_now {
             self.updater(ctx, "Checking for updates...", || Upd::Checked(check_latest()));
         }
+        if rescan {
+            self.scan(ctx);
+        }
 
         egui::TopBottomPanel::top("top")
             .frame(egui::Frame::none().inner_margin(16.0).fill(Color32::from_rgb(18, 26, 38)))
@@ -251,9 +491,10 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Oxide Util").size(24.0).strong().color(ACCENT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let any = self.pkgs.iter().any(|p| p.kind == self.tab);
                         let all = egui::Button::new(RichText::new("Update all").strong().color(Color32::BLACK)).fill(ACCENT);
-                        if ui.add_enabled(idle && !self.pkgs.is_empty(), all).clicked() {
-                            self.update(ctx, None);
+                        if ui.add_enabled(idle && any, all).clicked() {
+                            self.update(ctx, self.tab, None);
                         }
                         if ui.add_enabled(idle, egui::Button::new("Scan")).clicked() {
                             self.scan(ctx);
@@ -285,34 +526,63 @@ impl eframe::App for App {
                         ui.label(RichText::new(&self.status).weak());
                     }
                 });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for k in Kind::ALL {
+                        let n = self.pkgs.iter().filter(|p| p.kind == k).count();
+                        let text = RichText::new(format!("{}  {n}", k.label())).size(15.0);
+                        let text = if self.tab == k { text.color(ACCENT).strong() } else { text };
+                        if ui.selectable_label(self.tab == k, text).clicked() {
+                            self.tab = k;
+                        }
+                    }
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.pkgs.is_empty() {
+            if self.tab == Kind::Driver && !self.bios.is_empty() {
+                egui::Frame::none().fill(CARD).rounding(10.0).inner_margin(12.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(&self.bios).strong());
+                    ui.label(
+                        RichText::new("BIOS updates come from your motherboard maker. Firmware that Windows Update offers is listed below.")
+                            .small()
+                            .weak(),
+                    );
+                });
+                ui.add_space(6.0);
+            }
+            let rows: Vec<&Pkg> = self.pkgs.iter().filter(|p| p.kind == self.tab).collect();
+            if rows.is_empty() {
                 if idle {
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("Nothing to update. Hit Scan to check again.").size(16.0).weak());
+                        ui.label(RichText::new("Nothing to update here.").size(16.0).weak());
                     });
                 }
                 return;
             }
             let mut clicked = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for p in &self.pkgs {
+                for p in rows {
                     egui::Frame::none().fill(CARD).rounding(10.0).inner_margin(12.0).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
+                            app_icon(ui, p);
                             ui.vertical(|ui| {
                                 ui.label(RichText::new(&p.name).size(15.0).strong());
-                                ui.label(RichText::new(&p.id).small().weak());
+                                if p.kind == Kind::Software {
+                                    ui.label(RichText::new(&p.id).small().weak());
+                                }
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.add_enabled(idle, egui::Button::new("Update")).clicked() {
                                     clicked = Some(p.id.clone());
                                 }
                                 ui.label(RichText::new(&p.available).color(ACCENT).strong());
-                                ui.label("->");
-                                ui.label(RichText::new(&p.version).weak());
+                                if !p.version.is_empty() {
+                                    ui.label("->");
+                                    ui.label(RichText::new(&p.version).weak());
+                                }
                             });
                         });
                     });
@@ -320,7 +590,7 @@ impl eframe::App for App {
                 }
             });
             if clicked.is_some() {
-                self.update(ctx, clicked);
+                self.update(ctx, self.tab, clicked);
             }
         });
     }
@@ -329,7 +599,7 @@ impl eframe::App for App {
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 560.0])
+            .with_inner_size([820.0, 600.0])
             .with_title("Oxide Util")
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap()),
         ..Default::default()
@@ -339,6 +609,7 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             let mut app = App { auto_update: !no_auto_update_marker().exists(), ..Default::default() };
             app.scan(&cc.egui_ctx);
             if app.auto_update {
@@ -369,10 +640,36 @@ Discord           Discord.Discord      1.0.9    1.0.10    winget\n\
                 id: "Google.Chrome".into(),
                 version: "130.0".into(),
                 available: "131.0".into(),
+                ..Default::default()
             }
         );
         assert_eq!(p[1].id, "Discord.Discord");
         assert!(parse("No installed package found matching input criteria.").is_empty());
+    }
+
+    #[test]
+    fn parses_windows_update() {
+        let out = "bios\t\tASUSTeK ROG STRIX B650\tBIOS 2613 (2024-05-01)\n\
+driver\tabc-123\tNVIDIA - Display - 32.0.15.6094\tDisplay\n\
+windows\tdef-456\t2026-11 Cumulative Update\tKB5050001\n\
+garbage line\n";
+        let (p, bios) = parse_wu(out);
+        assert_eq!(bios, "ASUSTeK ROG STRIX B650 - BIOS 2613 (2024-05-01)");
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].kind, p[0].id.as_str()), (Kind::Driver, "abc-123"));
+        assert_eq!((p[1].kind, p[1].available.as_str()), (Kind::Windows, "KB5050001"));
+    }
+
+    #[test]
+    fn matches_icons_by_name() {
+        let icons = vec![
+            ("Discord".to_string(), "d.png".to_string()),
+            ("Google Chrome".to_string(), "c.png".to_string()),
+        ];
+        assert_eq!(find_icon("Google Chr…", &icons).map(String::as_str), Some("c.png"));
+        assert_eq!(find_icon("discord", &icons).map(String::as_str), Some("d.png"));
+        assert_eq!(find_icon("Steam", &icons), None);
+        assert_eq!(find_icon("", &icons), None);
     }
 
     #[test]

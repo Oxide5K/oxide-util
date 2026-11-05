@@ -25,8 +25,8 @@ struct App {
     rx: Option<Receiver<Msg>>,
 }
 
-const ACCENT: Color32 = Color32::from_rgb(255, 120, 40);
-const CARD: Color32 = Color32::from_rgb(34, 34, 40);
+const ACCENT: Color32 = Color32::from_rgb(120, 200, 255);
+const CARD: Color32 = Color32::from_rgb(28, 38, 52);
 
 fn winget(args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("winget");
@@ -135,7 +135,7 @@ impl eframe::App for App {
         let idle = self.busy.is_none();
 
         egui::TopBottomPanel::top("top")
-            .frame(egui::Frame::none().inner_margin(16.0).fill(Color32::from_rgb(24, 24, 28)))
+            .frame(egui::Frame::none().inner_margin(16.0).fill(Color32::from_rgb(18, 26, 38)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Oxide Util").size(24.0).strong().color(ACCENT));

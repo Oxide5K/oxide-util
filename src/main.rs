@@ -249,9 +249,25 @@ fn find_icon<'a>(name: &str, icons: &'a [(String, String)]) -> Option<&'a String
         .map(|(_, p)| p)
 }
 
+/// Game launchers keep themselves (and their games) updated, so they're not listed.
+fn is_launcher(id: &str) -> bool {
+    const PREFIXES: [&str; 8] = [
+        "Valve.Steam",
+        "EpicGames.",
+        "RockstarGames.",
+        "ElectronicArts.",
+        "Ubisoft.",
+        "Blizzard.",
+        "RiotGames.",
+        "GOG.",
+    ];
+    PREFIXES.iter().any(|p| id.starts_with(p))
+}
+
 fn scan_all() -> Scan {
     std::thread::scope(|s| {
-        let sw = s.spawn(|| winget(&["upgrade", "--include-unknown"]).map(|o| parse(&o)));
+        // no --include-unknown: rows with an "Unknown" installed version are mostly games/redistributables winget can't track
+        let sw = s.spawn(|| winget(&["upgrade"]).map(|o| parse(&o).into_iter().filter(|p| !is_launcher(&p.id)).collect::<Vec<_>>()));
         let wu = s.spawn(|| powershell("scan", WU_SCAN, &[]));
         let icons = s.spawn(|| powershell("icons", ICONS, &[]));
 
@@ -401,15 +417,13 @@ impl App {
             if kind != Kind::Software {
                 return Msg::Updated(install_wu(&ids));
             }
-            let mut args = vec!["upgrade", "--silent", "--accept-package-agreements"];
-            match &one {
-                Some(id) => args.extend(["--id", id.as_str(), "--exact"]),
-                None => args.push("--all"),
+            // one id at a time: `--all` would also update the rows we hide
+            for id in &ids {
+                if let Err(e) = winget(&["upgrade", "--silent", "--accept-package-agreements", "--id", id, "--exact"]) {
+                    return Msg::Updated(e);
+                }
             }
-            Msg::Updated(match winget(&args) {
-                Ok(_) => format!("Finished updating {target}."),
-                Err(e) => e,
-            })
+            Msg::Updated(format!("Finished updating {target}."))
         });
     }
 }
@@ -670,6 +684,13 @@ garbage line\n";
         assert_eq!(find_icon("discord", &icons).map(String::as_str), Some("d.png"));
         assert_eq!(find_icon("Steam", &icons), None);
         assert_eq!(find_icon("", &icons), None);
+    }
+
+    #[test]
+    fn hides_launchers() {
+        assert!(is_launcher("RockstarGames.Launcher"));
+        assert!(is_launcher("Valve.Steam"));
+        assert!(!is_launcher("Proton.ProtonVPN"));
     }
 
     #[test]

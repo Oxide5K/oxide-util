@@ -4,6 +4,8 @@
            UpgradeCode="6F3C2A1E-8B4D-4E7A-9C21-5D0B7E3A9F14" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Oxide Util is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon" SourceFile="assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Oxide Util">
@@ -15,7 +17,7 @@
 
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenu">
-        <Shortcut Id="StartMenuShortcut" Name="Oxide Util" Target="[#AppExe]" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="StartMenuShortcut" Name="Oxide Util" Target="[#AppExe]" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
         <RegistryValue Root="HKLM" Key="Software\Oxide5K\Oxide Util" Name="installed" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>

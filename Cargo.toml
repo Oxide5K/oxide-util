@@ -1,6 +1,6 @@
 [package]
 name = "oxide-util"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -9,3 +9,6 @@ eframe = "0.29"
 [profile.release]
 strip = true
 lto = true
+
+[build-dependencies]
+winresource = "0.1"

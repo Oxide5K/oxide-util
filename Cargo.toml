@@ -1,0 +1,11 @@
+[package]
+name = "oxide-util"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+
+[profile.release]
+strip = true
+lto = true

@@ -10,18 +10,76 @@ use std::sync::mpsc::{channel, Receiver};
 enum Kind {
     #[default]
     Software,
-    Driver,
-    Windows,
+    Graphics,
+    Network,
+    Audio,
+    Chipset,
+    Storage,
+    Peripherals,
+    Firmware,
+    OtherDriver,
 }
 
 impl Kind {
-    const ALL: [Kind; 3] = [Kind::Software, Kind::Driver, Kind::Windows];
+    const ALL: [Kind; 9] = [
+        Kind::Software,
+        Kind::Graphics,
+        Kind::Network,
+        Kind::Audio,
+        Kind::Chipset,
+        Kind::Storage,
+        Kind::Peripherals,
+        Kind::Firmware,
+        Kind::OtherDriver,
+    ];
     fn label(self) -> &'static str {
         match self {
             Kind::Software => "Software",
-            Kind::Driver => "Drivers & Firmware",
-            Kind::Windows => "Windows Update",
+            Kind::Graphics => "Graphics",
+            Kind::Network => "Network & Bluetooth",
+            Kind::Audio => "Audio",
+            Kind::Chipset => "Chipset & System",
+            Kind::Storage => "Storage",
+            Kind::Peripherals => "Peripherals",
+            Kind::Firmware => "Firmware & BIOS",
+            Kind::OtherDriver => "Other drivers",
         }
+    }
+}
+
+/// Sorts a Windows Update driver into a category by its driver class, falling back to its title.
+fn classify(class: &str, title: &str) -> Kind {
+    let by_class = match class.to_lowercase().as_str() {
+        "display" => Kind::Graphics,
+        "net" | "netservice" | "bluetooth" | "infrared" => Kind::Network,
+        "media" | "audioendpoint" | "audioprocessingobject" => Kind::Audio,
+        "system" | "usb" | "pci" | "sbp2" | "computer" | "processor" | "securitydevices" => Kind::Chipset,
+        "hdc" | "scsiadapter" | "diskdrive" | "volume" | "volumesnapshot" => Kind::Storage,
+        "hidclass" | "keyboard" | "mouse" | "camera" | "image" | "printer" | "biometric" | "monitor" | "smartcardreader" => Kind::Peripherals,
+        "firmware" => Kind::Firmware,
+        _ => Kind::OtherDriver,
+    };
+    if by_class != Kind::OtherDriver {
+        return by_class;
+    }
+    let t = title.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| t.contains(w));
+    if has(&["firmware", "bios", "uefi"]) {
+        Kind::Firmware
+    } else if has(&["graphics", "display", "nvidia", "radeon", "gpu"]) {
+        Kind::Graphics
+    } else if has(&["network", "ethernet", "wi-fi", "wifi", "wireless", "wlan", "lan ", "bluetooth"]) {
+        Kind::Network
+    } else if has(&["audio", "sound", "realtek high definition"]) {
+        Kind::Audio
+    } else if has(&["chipset", "management engine", "serial io", "smbus", "thunderbolt", "usb", "gna", "dynamic tuning"]) {
+        Kind::Chipset
+    } else if has(&["nvme", "sata", "raid", "storage", "rapid storage"]) {
+        Kind::Storage
+    } else if has(&["mouse", "keyboard", "touchpad", "camera", "webcam", "printer", "hid", "fingerprint"]) {
+        Kind::Peripherals
+    } else {
+        Kind::OtherDriver
     }
 }
 
@@ -72,22 +130,17 @@ const ACCENT: Color32 = Color32::from_rgb(120, 200, 255);
 const CARD: Color32 = Color32::from_rgb(28, 38, 52);
 const RELEASES: &str = "https://github.com/Oxide5K/oxide-util/releases/latest";
 
-/// Lists pending Windows Update items plus one `bios` line, tab-separated: kind, id, title, version.
+/// Lists every pending driver/firmware update Windows Update offers (optional ones included) plus one `bios` line.
+/// Tab-separated: kind, id, title, driver class, driver date.
 const WU_SCAN: &str = r#"
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $b = Get-CimInstance Win32_BIOS
 $m = Get-CimInstance Win32_BaseBoard
-"bios`t`t$($m.Manufacturer) $($m.Product)`tBIOS $($b.SMBIOSBIOSVersion) ($($b.ReleaseDate.ToString('yyyy-MM-dd')))"
-$r = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search('IsInstalled=0 and IsHidden=0')
+"bios`t`t$($m.Manufacturer) $($m.Product)`tBIOS $($b.SMBIOSBIOSVersion) ($($b.ReleaseDate.ToString('yyyy-MM-dd')))`t"
+$r = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0 and Type='Driver'")
 foreach ($u in $r.Updates) {
-    if ($u.Type -eq 2) {
-        $k = 'driver'
-        $v = if ($u.DriverClass -eq 'Firmware') { 'Firmware' } else { "$($u.DriverClass)" }
-    } else {
-        $k = 'windows'
-        $v = ($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ' '
-    }
-    "$k`t$($u.Identity.UpdateID)`t$($u.Title)`t$v"
+    $d = if ($u.DriverVerDate) { $u.DriverVerDate.ToString('yyyy-MM-dd') } else { '' }
+    "driver`t$($u.Identity.UpdateID)`t$($u.Title)`t$($u.DriverClass)`t$d"
 }
 "#;
 
@@ -96,7 +149,7 @@ const WU_INSTALL: &str = r#"
 param([string]$Ids)
 $want = $Ids -split ','
 $s = New-Object -ComObject Microsoft.Update.Session
-$r = $s.CreateUpdateSearcher().Search('IsInstalled=0 and IsHidden=0')
+$r = $s.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0 and Type='Driver'")
 $c = New-Object -ComObject Microsoft.Update.UpdateColl
 foreach ($u in $r.Updates) {
     if ($want -contains $u.Identity.UpdateID) {
@@ -219,17 +272,18 @@ fn parse_wu(out: &str) -> (Vec<Pkg>, String) {
     let mut pkgs = vec![];
     for l in out.lines() {
         let f: Vec<&str> = l.split('\t').collect();
-        let [k, id, name, v] = f[..] else { continue };
-        let kind = match k {
-            "bios" => {
-                bios = format!("{} - {}", name.trim(), v.trim());
-                continue;
-            }
-            "driver" => Kind::Driver,
-            "windows" => Kind::Windows,
-            _ => continue,
-        };
-        pkgs.push(Pkg { kind, name: name.into(), id: id.into(), available: v.into(), ..Default::default() });
+        let [k, id, name, class, date] = f[..] else { continue };
+        match k {
+            "bios" => bios = format!("{} - {}", name.trim(), class.trim()),
+            "driver" => pkgs.push(Pkg {
+                kind: classify(class, name),
+                name: name.into(),
+                id: id.into(),
+                available: date.into(),
+                ..Default::default()
+            }),
+            _ => {}
+        }
     }
     (pkgs, bios)
 }
@@ -302,7 +356,7 @@ fn scan_all() -> Scan {
     })
 }
 
-/// Installs Windows Update items elevated (one UAC prompt).
+/// Installs driver and firmware updates elevated (one UAC prompt).
 fn install_wu(ids: &[String]) -> String {
     // ids come from Windows Update itself, but they end up on a command line, so allow only GUID characters
     if ids.iter().any(|id| !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')) {
@@ -314,11 +368,11 @@ fn install_wu(ids: &[String]) -> String {
         Ok(out.status.code().unwrap_or(-1))
     };
     match run() {
-        Ok(2) => "Windows updates installed.".into(),
-        Ok(3) => "Some Windows updates failed to install.".into(),
-        Ok(10) => "Windows updates installed. Restart your PC to finish.".into(),
+        Ok(2) => "Driver updates installed.".into(),
+        Ok(3) => "Some driver updates failed to install.".into(),
+        Ok(10) => "Driver updates installed. Restart your PC to finish.".into(),
         Ok(1) => "Install cancelled (administrator permission is needed).".into(),
-        Ok(c) => format!("Windows Update install failed (code {c})."),
+        Ok(c) => format!("Driver install failed (code {c})."),
         Err(e) => e,
     }
 }
@@ -403,7 +457,7 @@ impl App {
     }
 
     fn scan(&mut self, ctx: &egui::Context) {
-        self.run(ctx, "Scanning your PC (Windows Update can take a minute)...".into(), || Msg::Scanned(scan_all()));
+        self.run(ctx, "Scanning your PC (checking drivers can take a minute)...".into(), || Msg::Scanned(scan_all()));
     }
 
     /// Updates the given rows of one category; `None` means everything in it.
@@ -541,10 +595,11 @@ impl eframe::App for App {
                     }
                 });
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for k in Kind::ALL {
                         let n = self.pkgs.iter().filter(|p| p.kind == k).count();
-                        let text = RichText::new(format!("{}  {n}", k.label())).size(15.0);
+                        let text = RichText::new(format!("{}  {n}", k.label())).size(14.0);
+                        let text = if n == 0 && self.tab != k { text.weak() } else { text };
                         let text = if self.tab == k { text.color(ACCENT).strong() } else { text };
                         if ui.selectable_label(self.tab == k, text).clicked() {
                             self.tab = k;
@@ -554,12 +609,12 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.tab == Kind::Driver && !self.bios.is_empty() {
+            if self.tab == Kind::Firmware && !self.bios.is_empty() {
                 egui::Frame::none().fill(CARD).rounding(10.0).inner_margin(12.0).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new(&self.bios).strong());
                     ui.label(
-                        RichText::new("BIOS updates come from your motherboard maker. Firmware that Windows Update offers is listed below.")
+                        RichText::new("BIOS updates come from your motherboard maker. Firmware that Windows Update still has pending is listed below.")
                             .small()
                             .weak(),
                     );
@@ -662,16 +717,29 @@ Discord           Discord.Discord      1.0.9    1.0.10    winget\n\
     }
 
     #[test]
-    fn parses_windows_update() {
-        let out = "bios\t\tASUSTeK ROG STRIX B650\tBIOS 2613 (2024-05-01)\n\
-driver\tabc-123\tNVIDIA - Display - 32.0.15.6094\tDisplay\n\
-windows\tdef-456\t2026-11 Cumulative Update\tKB5050001\n\
+    fn parses_driver_scan() {
+        let out = "bios\t\tASUSTeK ROG STRIX B650\tBIOS 2613 (2024-05-01)\t\n\
+driver\tabc-123\tNVIDIA - Display - 32.0.15.6094\tDisplay\t2026-10-01\n\
+driver\tdef-456\tIntel - Firmware - 1.2.3\tFirmware\t2026-09-01\n\
 garbage line\n";
         let (p, bios) = parse_wu(out);
         assert_eq!(bios, "ASUSTeK ROG STRIX B650 - BIOS 2613 (2024-05-01)");
         assert_eq!(p.len(), 2);
-        assert_eq!((p[0].kind, p[0].id.as_str()), (Kind::Driver, "abc-123"));
-        assert_eq!((p[1].kind, p[1].available.as_str()), (Kind::Windows, "KB5050001"));
+        assert_eq!((p[0].kind, p[0].id.as_str(), p[0].available.as_str()), (Kind::Graphics, "abc-123", "2026-10-01"));
+        assert_eq!(p[1].kind, Kind::Firmware);
+    }
+
+    #[test]
+    fn classifies_drivers() {
+        assert_eq!(classify("Net", "Intel - Net - 23.0"), Kind::Network);
+        assert_eq!(classify("Bluetooth", "x"), Kind::Network);
+        assert_eq!(classify("System", "Intel - System - 2.0"), Kind::Chipset);
+        assert_eq!(classify("SCSIAdapter", "Samsung NVMe"), Kind::Storage);
+        assert_eq!(classify("MEDIA", "Realtek - Audio"), Kind::Audio);
+        // unhelpful class falls back to the title
+        assert_eq!(classify("OtherHardware", "Microsoft Corporation AudioProcessingObject Driver Update"), Kind::Audio);
+        assert_eq!(classify("", "Intel(R) Management Engine Interface"), Kind::Chipset);
+        assert_eq!(classify("", "Something unknown"), Kind::OtherDriver);
     }
 
     #[test]

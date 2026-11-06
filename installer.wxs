@@ -2,7 +2,8 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Oxide Util" Manufacturer="Oxide5K" Version="$(Version)"
            UpgradeCode="6F3C2A1E-8B4D-4E7A-9C21-5D0B7E3A9F14" Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Oxide Util is already installed." />
+    <!-- AllowSameVersionUpgrades: local test builds reuse the released version number -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Oxide Util is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="AppIcon" SourceFile="assets\icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />

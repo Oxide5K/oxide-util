@@ -7,6 +7,7 @@ edition = "2021"
 eframe = "0.29"
 egui_extras = { version = "0.29", features = ["file", "image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
 
 [profile.release]
 strip = true
